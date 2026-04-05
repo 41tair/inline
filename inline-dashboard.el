@@ -116,8 +116,6 @@
     (define-key map (kbd "c") #'inline-dashboard-clear)
     (define-key map (kbd "e") #'inline-dashboard-show-error)
     (define-key map (kbd "TAB") #'inline-dashboard-toggle-error)
-    (define-key map (kbd "C-i") #'inline-dashboard-toggle-error)
-    (define-key map (kbd "<tab>") #'inline-dashboard-toggle-error)
     (define-key map [tab] #'inline-dashboard-toggle-error)
     map)
   "Keymap for `inline-dashboard-mode'.")

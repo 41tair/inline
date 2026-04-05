@@ -26,9 +26,14 @@
   :group 'inline)
 
 (defcustom inline-system-prompt
-  "You are Inline, an AI coding assistant.\nFollow project rules strictly.\nReturn only the replacement code for the target region without Markdown fences or explanations."
+  "You are Inline, an AI inline editing assistant.\nFollow project rules strictly.\nReturn only the replacement content for the target region without Markdown fences, commentary, or explanations."
   "Base system prompt appended after project constraints."
   :type 'string
+  :group 'inline)
+
+(defcustom inline-skill-directory-names '("skills" ".inline/skills")
+  "Project-relative directories searched for Inline skills."
+  :type '(repeat string)
   :group 'inline)
 
 (defcustom inline-context-before-lines 0
@@ -126,10 +131,17 @@ The return value is JSON-encoded before sending."
 (defvar inline--task-counter 0
   "Monotonic counter for task IDs.")
 
+(defconst inline--package-root-directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Root directory of the installed Inline package.")
+
 (cl-defstruct (inline-task (:constructor inline--make-task))
   id
   status
   type
+  skills
+  context-scope
+  target-kind
   created-at
   started-at
   finished-at
@@ -169,6 +181,16 @@ The return value is JSON-encoded before sending."
   (when root
     (file-name-nondirectory (directory-file-name root))))
 
+(defun inline--workspace-root (buffer)
+  "Return workspace root for BUFFER."
+  (or (inline--project-root buffer)
+      (with-current-buffer buffer
+        default-directory)))
+
+(defun inline--package-root ()
+  "Return the installed Inline package root."
+  inline--package-root-directory)
+
 (defun inline--agents-file (start-dir)
   "Search upward from START-DIR for an agents file."
   (let ((dir (file-name-as-directory (expand-file-name start-dir)))
@@ -200,11 +222,58 @@ The return value is JSON-encoded before sending."
     (when path
       (inline--read-file path))))
 
-(defun inline--build-system-prompt (agents)
-  "Build system prompt with AGENTS prepended."
+(defun inline--collect-skill-files (root skills)
+  "Collect skill files from ROOT into SKILLS."
+  (when root
+    (dolist (dirname inline-skill-directory-names)
+      (let ((dir (expand-file-name dirname root)))
+        (when (file-directory-p dir)
+          (dolist (path (directory-files dir t nil t))
+            (when (and (file-regular-p path)
+                       (member (downcase (or (file-name-extension path) ""))
+                               '("md" "txt")))
+              (let ((name (file-name-base path)))
+                (unless (assoc-string name skills t)
+                  (push (cons name path) skills)))))))))
+  skills)
+
+(defun inline--skill-files (buffer)
+  "Return available skill files for BUFFER as an alist."
+  (let ((skills nil))
+    (setq skills (inline--collect-skill-files (inline--workspace-root buffer) skills))
+    (setq skills (inline--collect-skill-files (inline--package-root) skills))
+    (nreverse skills)))
+
+(defun inline--available-skills (&optional buffer)
+  "Return available skill names for BUFFER."
+  (mapcar #'car (inline--skill-files (or buffer (current-buffer)))))
+
+(defun inline--skill-texts (buffer skill-names)
+  "Return selected skill text alist for BUFFER and SKILL-NAMES."
+  (let ((files (inline--skill-files buffer))
+        (skills nil))
+    (dolist (name skill-names)
+      (when-let ((path (cdr (assoc-string name files t))))
+        (when-let ((text (inline--read-file path)))
+          (push (cons name text) skills))))
+    (nreverse skills)))
+
+(defun inline--build-system-prompt (agents skills)
+  "Build system prompt with AGENTS and SKILLS prepended."
   (concat
    (when (and agents (not (string-empty-p agents)))
      (format "Project Rules (from AGENTS):\n%s\n\n" agents))
+   (when skills
+     (concat
+      "Active Skills:\n"
+      (mapconcat
+       (lambda (skill)
+         (format "[%s]\n%s"
+                 (car skill)
+                 (string-trim-right (cdr skill))))
+       skills
+       "\n\n")
+      "\n\n"))
    inline-system-prompt))
 
 (defun inline--context-before (start)
@@ -228,22 +297,47 @@ The return value is JSON-encoded before sending."
   (when (fboundp 'add-log-current-defun)
     (ignore-errors (add-log-current-defun))))
 
+(defun inline--file-type (file buffer)
+  "Return concise file type for FILE and BUFFER."
+  (or (when file
+        (file-name-extension file))
+      (with-current-buffer buffer
+        (when-let ((mode-name (and major-mode (symbol-name major-mode))))
+          (string-remove-suffix "-mode" mode-name)))
+      "none"))
+
 (defun inline--build-user-prompt (task instruction region-text)
   "Build user prompt for TASK using INSTRUCTION and REGION-TEXT."
   (let* ((file (inline-task-file task))
          (mode (with-current-buffer (inline-task-buffer task)
                  (symbol-name major-mode)))
+         (file-type (inline--file-type file (inline-task-buffer task)))
+         (skills (inline-task-skills task))
+         (context-scope (inline-task-context-scope task))
+         (target-kind (inline-task-target-kind task))
          (defun (with-current-buffer (inline-task-buffer task)
                   (inline--defun-name)))
-         (before (with-current-buffer (inline-task-buffer task)
-                   (inline--context-before (marker-position (inline-task-start-marker task)))))
-         (after (with-current-buffer (inline-task-buffer task)
-                  (inline--context-after (marker-position (inline-task-end-marker task))))))
+         (before (when (eq context-scope 'around)
+                   (with-current-buffer (inline-task-buffer task)
+                     (inline--context-before (marker-position (inline-task-start-marker task))))))
+         (after (when (eq context-scope 'around)
+                  (with-current-buffer (inline-task-buffer task)
+                    (inline--context-after (marker-position (inline-task-end-marker task))))))
+         (buffer-text (when (eq context-scope 'buffer)
+                        (with-current-buffer (inline-task-buffer task)
+                          (buffer-substring-no-properties (point-min) (point-max))))))
     (concat
-     (format "Mode: %s\n" (capitalize (symbol-name (inline-task-type task))))
-     (when defun (format "Symbol: %s\n" defun))
-     (format "File: %s\n" file)
-     (format "Major mode: %s\n\n" mode)
+     "Request Context:\n"
+     (format "- Operation: %s\n" (capitalize (symbol-name (inline-task-type task))))
+     (format "- Target Kind: %s\n" (capitalize (symbol-name (or target-kind 'region))))
+     (format "- Context Scope: %s\n" (capitalize (symbol-name context-scope)))
+     (format "- File: %s\n" file)
+     (format "- File Type: %s\n" file-type)
+     (format "- Major Mode: %s\n" mode)
+     (when defun (format "- Symbol: %s\n" defun))
+     (when skills
+       (format "- Selected Skills: %s\n" (string-join skills ", ")))
+     "\n"
      "Instruction:\n"
      instruction
      "\n\n"
@@ -252,9 +346,11 @@ The return value is JSON-encoded before sending."
      "Target Region:\n"
      region-text
      "\n\n"
+     (when buffer-text
+       (format "Full Buffer Context:\n%s\n\n" buffer-text))
      (when after
        (format "Context After:\n%s\n\n" after))
-     "Return only the replacement code.")))
+     "Return only the replacement content that should replace the target region.")))
 
 (defun inline--next-task-id ()
   "Return the next task ID string."
@@ -332,6 +428,9 @@ The return value is JSON-encoded before sending."
          (end-marker (plist-get context :end-marker))
          (file (plist-get context :file))
          (type (plist-get context :type))
+         (skills (plist-get context :skills))
+         (context-scope (or (plist-get context :context-scope) 'around))
+         (target-kind (plist-get context :target-kind))
          (start (marker-position start-marker))
          (end (marker-position end-marker)))
     (unless (buffer-live-p origin)
@@ -341,21 +440,29 @@ The return value is JSON-encoded before sending."
     (with-current-buffer origin
       (let* ((region-text (buffer-substring-no-properties start end))
              (agents (inline--agents-text origin))
-             (system (inline--build-system-prompt agents))
+             (skill-texts (inline--skill-texts origin skills))
+             (system (inline--build-system-prompt agents skill-texts))
+             (proj-root (inline--project-root origin))
              (task (inline--make-task
                     :id (inline--next-task-id)
                     :status 'pending
                     :type type
+                    :skills skills
+                    :context-scope context-scope
+                    :target-kind target-kind
                     :created-at (current-time)
                     :buffer origin
                     :file file
-                    :project-root (inline--project-root origin)
-                    :project-name (inline--project-name (inline--project-root origin))
+                    :project-root proj-root
+                    :project-name (inline--project-name proj-root)
                     :start-marker (copy-marker start)
                     :end-marker (copy-marker end t)
                     :start-line (line-number-at-pos start)
                     :start-column (save-excursion (goto-char start) (current-column))
-                    :summary (inline--task-summary prompt)
+                    :summary (inline--task-summary
+                              (if (string-empty-p prompt)
+                                  (format "Skills: %s" (string-join skills ", "))
+                                prompt))
                     :prompt prompt
                     :system-prompt system
                     :original-text region-text
@@ -399,23 +506,31 @@ The return value is JSON-encoded before sending."
       (:error (inline--task-fail task payload 'failed))
       (_ (inline--task-fail task (format "%s" payload) 'failed)))))
 
+(defun inline--task-finalize (_task fmt &rest args)
+  "Refresh UI after task state change and message with FMT and ARGS."
+  (inline--dashboard-refresh-if-present)
+  (inline--update-mode-line)
+  (inline--maybe-start-next)
+  (apply #'message fmt args))
+
+(defun inline--cleanup-task-resources (task)
+  "Kill process and response buffer associated with TASK."
+  (when-let ((proc (inline-task-process task)))
+    (ignore-errors (delete-process proc)))
+  (when-let ((buf (inline-task-response-buffer task)))
+    (when (buffer-live-p buf)
+      (kill-buffer buf))))
+
 (defun inline--task-timeout (task)
   "Mark TASK as timed out and kill its process."
   (when (eq (inline-task-status task) 'running)
     (inline--task-hide-tip task)
-    (when-let ((proc (inline-task-process task)))
-      (ignore-errors (delete-process proc)))
-    (when-let ((buf (inline-task-response-buffer task)))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))
+    (inline--cleanup-task-resources task)
     (setf (inline-task-status task) 'timeout
           (inline-task-finished-at task) (current-time)
           (inline-task-error task) "Request timed out"
           (inline-task-timeout-timer task) nil)
-    (inline--dashboard-refresh-if-present)
-    (inline--update-mode-line)
-    (inline--maybe-start-next)
-    (message "Inline: Task %s timed out" (inline-task-id task))))
+    (inline--task-finalize task "Inline: Task %s timed out" (inline-task-id task))))
 
 (defun inline--task-fail (task error status)
   "Mark TASK as failed with ERROR and STATUS."
@@ -423,10 +538,7 @@ The return value is JSON-encoded before sending."
   (setf (inline-task-status task) status
         (inline-task-finished-at task) (current-time)
         (inline-task-error task) error)
-  (inline--dashboard-refresh-if-present)
-  (inline--update-mode-line)
-  (inline--maybe-start-next)
-  (message "Inline: Task %s failed" (inline-task-id task)))
+  (inline--task-finalize task "Inline: Task %s failed" (inline-task-id task)))
 
 (defun inline--search-original (buffer text)
   "Return (START END) for TEXT in BUFFER if unique, else nil."
@@ -493,15 +605,12 @@ The return value is JSON-encoded before sending."
       (setf (inline-task-status task) 'conflict
             (inline-task-finished-at task) (current-time)
             (inline-task-error task) "Region changed; result not applied")))
-  (inline--dashboard-refresh-if-present)
-  (inline--update-mode-line)
-  (inline--maybe-start-next)
-  (message "Inline: Task %s %s"
-           (inline-task-id task)
-           (pcase (inline-task-status task)
-             ('done "completed")
-             ('conflict "conflicted")
-             (_ "finished"))))
+  (inline--task-finalize task "Inline: Task %s %s"
+                        (inline-task-id task)
+                        (pcase (inline-task-status task)
+                          ('done "completed")
+                          ('conflict "conflicted")
+                          (_ "finished"))))
 
 (defun inline-task-kill (task)
   "Kill TASK if running or pending."
@@ -510,23 +619,17 @@ The return value is JSON-encoded before sending."
     (when (inline-task-timeout-timer task)
       (cancel-timer (inline-task-timeout-timer task))
       (setf (inline-task-timeout-timer task) nil))
-    (when-let ((proc (inline-task-process task)))
-      (ignore-errors (delete-process proc)))
-    (when-let ((buf (inline-task-response-buffer task)))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))
+    (inline--cleanup-task-resources task)
     (setf (inline-task-status task) 'killed
           (inline-task-finished-at task) (current-time))
     (setq inline--task-queue (delq task inline--task-queue))
-    (inline--dashboard-refresh-if-present)
-    (inline--update-mode-line)
-    (inline--maybe-start-next)
-    (message "Inline: Task %s killed" (inline-task-id task))))
+    (inline--task-finalize task "Inline: Task %s killed" (inline-task-id task))))
 
 (defvar inline-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c i i") #'inline)
     (define-key map (kbd "C-c i f") #'inline-fill)
-    (define-key map (kbd "C-c i r") #'inline-refactor)
+    (define-key map (kbd "C-c i e") #'inline-expand)
     (define-key map (kbd "C-c i d") #'inline-dashboard)
     map)
   "Keymap for `inline-mode'.")

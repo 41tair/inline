@@ -6,6 +6,7 @@
 ;;; Code:
 
 (require 'inline-core)
+(require 'thingatpt)
 (require 'subr-x)
 
 (defcustom inline-prompt-buffer-name "*Inline Prompt*"
@@ -22,6 +23,36 @@
 (defcustom inline-prompt-history-max 200
   "Maximum number of history entries to keep."
   :type 'integer
+  :group 'inline)
+
+(defcustom inline-prompt-directive-aliases
+  '(("skill" . ("s"))
+    ("context" . ("ctx")))
+  "Alias table for built-in prompt directives.
+Each entry is of the form (CANONICAL . ALIASES), where CANONICAL is the
+directive name without the leading slash and ALIASES is a list of accepted
+short forms."
+  :type '(alist :key-type string :value-type (repeat string))
+  :group 'inline)
+
+(defcustom inline-prompt-context-value-aliases
+  '(("around" . ("a"))
+    ("buffer" . ("b")))
+  "Alias table for prompt context values.
+Each entry is of the form (CANONICAL . ALIASES), where CANONICAL is the
+normalized context scope and ALIASES is a list of accepted short forms."
+  :type '(alist :key-type string :value-type (repeat string))
+  :group 'inline)
+
+(defcustom inline-prompt-skill-aliases
+  '(("translate" . ("tr" "tl"))
+    ("expand" . ("exp" "ex"))
+    ("polish" . ("pol" "pl"))
+    ("english-coach" . ("ec" "eng")))
+  "Alias table for prompt skill commands.
+Each entry is of the form (CANONICAL . ALIASES), where CANONICAL is the skill
+name and ALIASES is a list of accepted short forms."
+  :type '(alist :key-type string :value-type (repeat string))
   :group 'inline)
 
 (defvar inline--prompt-history nil
@@ -44,6 +75,113 @@
 
 (defvar-local inline--prompt-origin-buffer nil
   "Buffer where the prompt was initiated.")
+
+(defun inline--alias-map (definitions &optional allowed)
+  "Return alias hash table built from DEFINITIONS.
+DEFINITIONS should be an alist of (CANONICAL . ALIASES). When ALLOWED is non-nil,
+only canonical names present in ALLOWED are included. Signal `user-error' when
+two active canonical names claim the same alias."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (entry definitions)
+      (let* ((canonical (car entry))
+             (aliases (cdr entry)))
+        (when (or (null allowed) (member canonical allowed))
+          (dolist (alias aliases)
+            (let ((existing (gethash alias table)))
+              (cond
+               ((null existing)
+                (puthash alias canonical table))
+               ((string-equal existing canonical)
+                nil)
+               (t
+                (user-error "Inline: alias /%s is declared for both /%s and /%s"
+                            alias existing canonical))))))))
+    table))
+
+(defun inline--directive-command (name)
+  "Return canonical directive command for NAME."
+  (or (gethash name (inline--alias-map inline-prompt-directive-aliases))
+      name))
+
+(defun inline--context-scope-value (value)
+  "Return canonical context scope for VALUE."
+  (or (gethash value (inline--alias-map inline-prompt-context-value-aliases))
+      value))
+
+(defun inline--normalize-skill-name (name available)
+  "Return canonical skill name for NAME when present in AVAILABLE."
+  (cond
+   ((member name available) name)
+   (t
+    (gethash name
+             (inline--alias-map inline-prompt-skill-aliases available)))))
+
+(defun inline--check-prompt-alias-collisions (available)
+  "Signal `user-error' when active prompt aliases collide.
+AVAILABLE is the list of active skill names for the current buffer."
+  (let ((directive-map (inline--alias-map inline-prompt-directive-aliases))
+        (skill-map (inline--alias-map inline-prompt-skill-aliases available)))
+    (maphash
+     (lambda (alias skill)
+       (when-let ((directive (gethash alias directive-map)))
+         (user-error "Inline: alias /%s is declared for both /%s and /%s"
+                     alias directive skill)))
+     skill-map)))
+
+(defun inline--primary-alias (canonical definitions)
+  "Return primary alias for CANONICAL from DEFINITIONS."
+  (car (cdr (assoc-string canonical definitions t))))
+
+(defun inline--prompt-help-command-entries (available)
+  "Return visible prompt help command entries for AVAILABLE skills."
+  (let ((entries nil))
+    (dolist (skill available)
+      (when-let ((alias (inline--primary-alias skill inline-prompt-skill-aliases)))
+        (push (cons (format "/%s" alias) skill) entries)))
+    (nreverse entries)))
+
+(defun inline--format-prompt-help-columns (entries)
+  "Format ENTRIES as two-column prompt help lines."
+  (let ((lines nil))
+    (while entries
+      (let* ((left (pop entries))
+             (right (pop entries))
+             (left-text (format "  %-4s %s" (car left) (cdr left)))
+             (line (if right
+                       (format "%-26s %s"
+                               left-text
+                               (format "%-4s %s" (car right) (cdr right)))
+                     left-text)))
+        (push line lines)))
+    (nreverse lines)))
+
+(defun inline--skill-aliases-for-display (skill)
+  "Return visible alias string for SKILL."
+  (when-let ((aliases (cdr (assoc-string skill inline-prompt-skill-aliases t))))
+    (string-join (mapcar (lambda (alias) (format "/%s" alias)) aliases) ", ")))
+
+(defun inline--prompt-skill-lines (available)
+  "Return visible skill inventory lines for AVAILABLE."
+  (if available
+      (cons "Available skills:"
+            (mapcar (lambda (skill)
+                      (if-let ((aliases (inline--skill-aliases-for-display skill)))
+                          (format "  %-14s %s" skill aliases)
+                        (format "  %s" skill)))
+                    available))
+    '("Available skills:" "  none")))
+
+(defun inline--prompt-help-lines (available)
+  "Return visible prompt help lines for AVAILABLE skills."
+  (inline--prompt-skill-lines available))
+
+(defun inline--prompt-header-line (available)
+  "Return compact prompt header line for AVAILABLE skills."
+  (string-join
+   (mapcar (lambda (entry)
+             (format "%s %s" (car entry) (cdr entry)))
+           (inline--prompt-help-command-entries available))
+   "   "))
 
 (defun inline--ensure-history-loaded ()
   "Load history from `inline-prompt-history-file' if needed."
@@ -204,11 +342,50 @@ STEP should be 1 (older) or -1 (newer)."
   (setq-local buffer-read-only nil)
   (setq-local truncate-lines nil))
 
-(defun inline--region-required ()
-  "Return (START END) if region is active, otherwise raise an error."
-  (unless (use-region-p)
-    (user-error "Inline: select a region first"))
-  (list (region-beginning) (region-end)))
+(defun inline--defun-bounds ()
+  "Return bounds of the current defun, or nil."
+  (save-excursion
+    (condition-case nil
+        (let (start end)
+          (end-of-defun)
+          (setq end (point))
+          (beginning-of-defun)
+          (setq start (point))
+          (when (< start end)
+            (cons start end)))
+      (error nil))))
+
+(defun inline--line-bounds ()
+  "Return bounds of the current line."
+  (cons (line-beginning-position)
+        (line-beginning-position 2)))
+
+(defun inline--target-at-point ()
+  "Return a plist describing the current target."
+  (cond
+   ((use-region-p)
+    (list :start (region-beginning)
+          :end (region-end)
+          :kind 'selection))
+   ((derived-mode-p 'prog-mode)
+    (if-let ((bounds (inline--defun-bounds)))
+        (list :start (car bounds)
+              :end (cdr bounds)
+              :kind 'defun)
+      (let ((bounds (inline--line-bounds)))
+        (list :start (car bounds)
+              :end (cdr bounds)
+              :kind 'line))))
+   ((bounds-of-thing-at-point 'paragraph)
+    (let ((bounds (bounds-of-thing-at-point 'paragraph)))
+      (list :start (car bounds)
+            :end (cdr bounds)
+            :kind 'paragraph)))
+   (t
+    (let ((bounds (inline--line-bounds)))
+      (list :start (car bounds)
+            :end (cdr bounds)
+            :kind 'line)))))
 
 (defun inline--region-summary (start end)
   "Return a plist summary of region START END."
@@ -227,37 +404,56 @@ STEP should be 1 (older) or -1 (newer)."
                     (plist-get info :file)
                     (plist-get info :line)
                     (plist-get info :column)))
-    (insert (format "Region: %d lines, %d chars\n"
+    (insert (format "Target: %s, %d lines, %d chars\n"
+                    (capitalize (symbol-name (plist-get info :target-kind)))
                     (plist-get info :lines)
                     (plist-get info :chars)))
     (insert (format "Preview: %s\n" (plist-get info :preview)))
+    (dolist (line (or (plist-get info :help-lines)
+                      (inline--prompt-help-lines
+                       (mapcar #'car inline-prompt-skill-aliases))))
+      (insert line "\n"))
     (insert "\n")
     (add-text-properties start (point)
                          '(read-only t front-sticky t rear-nonsticky t))))
 
-(defun inline--open-prompt (type start end)
-  "Open the Inline prompt buffer for TYPE using region START END."
+(defun inline--open-prompt (type target &optional defaults initial-input)
+  "Open the Inline prompt buffer for TYPE.
+TARGET identifies the replacement range. DEFAULTS seeds prompt metadata.
+INITIAL-INPUT pre-populates the editable area."
   (inline--ensure-history-loaded)
   (let* ((origin (current-buffer))
+         (start (plist-get target :start))
+         (end (plist-get target :end))
          (file (or (buffer-file-name origin) (buffer-name origin)))
          (line (line-number-at-pos start))
          (column (save-excursion (goto-char start) (current-column)))
          (summary (inline--region-summary start end))
+         (available-skills (inline--available-skills origin))
          (buf (get-buffer-create inline-prompt-buffer-name))
          (info (list :file file
                      :line line
                      :column column
+                     :target-kind (plist-get target :kind)
                      :lines (plist-get summary :lines)
                      :chars (plist-get summary :chars)
-                     :preview (plist-get summary :preview))))
+                     :preview (plist-get summary :preview)
+                     :help-lines (inline--prompt-help-lines available-skills))))
     (with-current-buffer buf
       (inline-prompt-mode)
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (inline--insert-header type info))
+        (inline--insert-header type info)
+        (when initial-input
+          (insert initial-input)))
+      (setq-local header-line-format
+                  (inline--prompt-header-line available-skills))
       (setq inline--prompt-start (point-marker))
       (setq inline--prompt-context
             (list :type type
+                  :skills (plist-get defaults :skills)
+                  :context-scope (or (plist-get defaults :context-scope) 'around)
+                  :target-kind (plist-get target :kind)
                   :origin-buffer origin
                   :start-marker (with-current-buffer origin (copy-marker start))
                   :end-marker (with-current-buffer origin (copy-marker end t))
@@ -270,18 +466,71 @@ STEP should be 1 (older) or -1 (newer)."
       (goto-char (point-max)))
     (pop-to-buffer buf)))
 
+(defun inline--parse-skill-list (text)
+  "Parse skill list from TEXT."
+  (cl-remove-if
+   #'string-empty-p
+   (mapcar #'string-trim
+           (split-string text "[,[:space:]]+" t))))
+
+(defun inline--prompt-directives (text context)
+  "Parse TEXT for prompt directives using CONTEXT."
+  (let ((skills (copy-sequence (or (plist-get context :skills) nil)))
+        (context-scope (or (plist-get context :context-scope) 'around))
+        (available (inline--available-skills (plist-get context :origin-buffer)))
+        (body-lines nil))
+    (inline--check-prompt-alias-collisions available)
+    (dolist (line (split-string text "\n"))
+      (let ((trimmed (string-trim-left line)))
+        (if (string-match "\\`/\\([[:alnum:]-]+\\)\\(?:\\s-+\\(.+\\)\\)?\\s-*\\'" trimmed)
+            (let* ((raw-command (downcase (match-string 1 trimmed)))
+                   (args (match-string 2 trimmed))
+                   (command (inline--directive-command raw-command)))
+              (cond
+               ((and args (string= command "context"))
+                (pcase (inline--context-scope-value (downcase args))
+                  ("buffer" (setq context-scope 'buffer))
+                  ("around" (setq context-scope 'around))
+                  (_ (push line body-lines))))
+               ((and args (member command '("skill" "skills")))
+                (let ((matched nil))
+                  (dolist (name (inline--parse-skill-list args))
+                    (when-let ((skill (inline--normalize-skill-name
+                                       (downcase name)
+                                       available)))
+                      (setq matched t)
+                      (cl-pushnew skill skills :test #'string-equal)))
+                  (unless matched
+                    (push line body-lines))))
+               ((null args)
+                (if-let ((skill (inline--normalize-skill-name raw-command available)))
+                    (cl-pushnew skill skills :test #'string-equal)
+                  (push line body-lines)))
+               (t
+                (push line body-lines))))
+          (push line body-lines))))
+    (list :instruction (string-trim (string-join (nreverse body-lines) "\n"))
+          :skills skills
+          :context-scope context-scope)))
+
 (defun inline-prompt-submit ()
   "Submit the prompt from the prompt buffer."
   (interactive)
   (let* ((text (inline--prompt-current-input))
-         (trimmed (string-trim text))
+         (parsed (inline--prompt-directives text inline--prompt-context))
+         (instruction (plist-get parsed :instruction))
+         (skills (plist-get parsed :skills))
+         (context-scope (plist-get parsed :context-scope))
          (context inline--prompt-context)
          (origin inline--prompt-origin-buffer))
-    (when (string-empty-p trimmed)
+    (when (and (string-empty-p instruction)
+               (null skills))
       (user-error "Inline: prompt is empty"))
     (inline--history-add text)
     (inline--save-prompt-history)
-    (inline--enqueue-task context text)
+    (inline--enqueue-task (plist-put (plist-put context :skills skills)
+                                     :context-scope context-scope)
+                          instruction)
     (kill-buffer (current-buffer))
     (when (buffer-live-p origin)
       (pop-to-buffer origin))))
@@ -294,17 +543,22 @@ STEP should be 1 (older) or -1 (newer)."
     (when (buffer-live-p origin)
       (pop-to-buffer origin))))
 
-(defun inline-fill ()
-  "Start an Inline Fill request for the active region."
+(defun inline ()
+  "Start a generic Inline request for the current target."
   (interactive)
-  (cl-destructuring-bind (start end) (inline--region-required)
-    (inline--open-prompt 'fill start end)))
+  (inline--open-prompt 'inline (inline--target-at-point)))
 
-(defun inline-refactor ()
-  "Start an Inline Refactor request for the active region."
+(defun inline-fill ()
+  "Start an Inline Fill request for the current target."
   (interactive)
-  (cl-destructuring-bind (start end) (inline--region-required)
-    (inline--open-prompt 'refactor start end)))
+  (inline--open-prompt 'fill (inline--target-at-point)))
+
+(defun inline-expand ()
+  "Start an Inline Expand request for the current target."
+  (interactive)
+  (inline--open-prompt 'expand
+                       (inline--target-at-point)
+                       '(:skills ("expand"))))
 
 (add-hook 'kill-emacs-hook #'inline--save-prompt-history)
 
